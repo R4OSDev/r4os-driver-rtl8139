@@ -1,4 +1,5 @@
 const r4os = @import("r4os");
+const rx_recovery = @import("rx_guard.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("rtl8139_init", "rtl8139_shutdown"));
@@ -111,6 +112,8 @@ const State = struct {
     watchdog_idle_polls: u64 = 0,
     watchdog_drains: u64 = 0,
     rx_recoveries: u64 = 0,
+    rx_stall_recoveries: u64 = 0,
+    rx_head_guard: rx_recovery.Guard = .{},
     // 0.56.37: transmit() ist NICHT reentrant - Slot-Wahl, Puffer-Kopie
     // und TSAD/TSD-Writes muessen atomar zusammenbleiben. Seit der
     // 4-KB-IPC-Segmentierung feuert der proaktive net-rx-Retransmit
@@ -451,6 +454,7 @@ fn prepareTraffic(ctx: *const r4os.r4dev.DriverContext) void {
     ctx.portOutl(state.io_base + REG_RCR, RCR_ACCEPT_PHYSICAL_MATCH | RCR_ACCEPT_BROADCAST | RCR_DMA_UNLIMITED | RCR_RBLEN_16K);
     ctx.portOutl(state.io_base + REG_TCR, 0);
     state.rx_head = 0;
+    state.rx_head_guard.reset();
     state.tx_slot = 0;
     clearTxPending(&state);
     ctx.portOutw(state.io_base + REG_CAPR, 0xFFF0);
@@ -618,6 +622,10 @@ fn flushDeferredDrain(s: *State) void {
 }
 
 fn recoverRxOverflow(s: *State) void {
+    recoverRxReceiver(s, false);
+}
+
+fn recoverRxReceiver(s: *State, stalled_head: bool) void {
     var ctx = context();
     ctx.portOutb(s.io_base + REG_COMMAND, CMD_TX_ENABLE);
     s.rx_head = 0;
@@ -626,22 +634,36 @@ fn recoverRxOverflow(s: *State) void {
     ctx.portOutw(s.io_base + REG_CAPR, 0xFFF0);
     ctx.portOutb(s.io_base + REG_COMMAND, CMD_RX_ENABLE | CMD_TX_ENABLE);
     ctx.portOutw(s.io_base + REG_ISR, ISR_RXOVW | ISR_ROK);
+    s.rx_head_guard.reset();
     s.rx_recoveries += 1;
+    if (stalled_head) {
+        s.rx_stall_recoveries += 1;
+        ctx.logWarn("RTL8139.R4D persistent invalid RX head recovered");
+    }
 }
 
 fn drainRx(s: *State, count_invalid: bool) void {
     var ctx = context();
     var guard: usize = 0;
     const rx = rxBytes(s);
+    if ((ctx.portInb(s.io_base + REG_COMMAND) & CMD_RX_BUFFER_EMPTY) != 0) {
+        s.rx_head_guard.reset();
+        return;
+    }
     while ((ctx.portInb(s.io_base + REG_COMMAND) & CMD_RX_BUFFER_EMPTY) == 0 and guard < RX_DRAIN_BUDGET) : (guard += 1) {
         const head = @as(usize, s.rx_head) % RX_BUFFER_SIZE;
         const frame_status = readRxLe16(rx, head);
         const len = readRxLe16(rx, head + 2);
-        if (frame_status == 0 or len == 0) break;
-        if ((frame_status & 1) == 0 or len < 4 or len > 1536 + 4) {
-            if (count_invalid) s.bad_frames += 1;
+        if (!rx_recovery.headerValid(frame_status, len)) {
+            const first_sample = s.rx_head_guard.samples == 0;
+            if (count_invalid and first_sample) s.bad_frames += 1;
+            if (s.rx_head_guard.observe(s.rx_head, frame_status, len)) {
+                if (!count_invalid or !first_sample) s.bad_frames += 1;
+                recoverRxReceiver(s, true);
+            }
             break;
         }
+        s.rx_head_guard.reset();
         const frame_len: usize = @intCast(len - 4);
         const frame_start = (head + 4) % RX_BUFFER_SIZE;
         if (frame_start + frame_len <= RX_BUFFER_SIZE) {

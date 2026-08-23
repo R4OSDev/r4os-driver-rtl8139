@@ -10,4 +10,13 @@ pub fn build(b: *std.Build) void {
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
+
+    const guard_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/rx_guard.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const run_guard_tests = b.addRunArtifact(guard_tests);
+    const test_step = b.step("test", "Run RTL8139 RX recovery tests");
+    test_step.dependOn(&run_guard_tests.step);
 }
