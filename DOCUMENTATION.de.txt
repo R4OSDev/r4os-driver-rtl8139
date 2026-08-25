@@ -2,21 +2,37 @@
 ===========
 
 Projektstruktur seit 0.51.22
---------------------------------
+----------------------------
 
 Dieses Verzeichnis ist ein eigenstaendiges R4OS-SDK-Projekt fuer RTL8139.R4D.
 
-Build:
+Build unter Windows:
 
-    cd Code\System\Driver\RTL8139
-    ..\..\..\DevTools\Zig\zig.exe build
+    Build.bat test
 
-Artefakt:
+Build unter Linux:
 
-    zig-out\RTL8139.R4D
+    ./Build.sh test
+
+Artefakt: zig-out/RTL8139.R4D
 
 Manifest:
 
     module.R4MF
 
 Image-Zielpfad: C:\R4OS\DRIVERS\RTL8139.R4D
+
+RX-Handoff seit 0.69.49
+-----------------------
+
+Der externe IRQ liest und quittiert den ISR genau einmal, zaehlt Fehler- und
+Overflowursachen und veroeffentlicht fuer RX nur adapterbezogene Arbeit ueber
+DriverApi v23. Reine TOK-/TER-Ursachen wecken den RX-Pfad nicht. Ringcursor,
+Framekopie, R4P-Dispatch, Antworten und Waiter-Wakeups bleiben vollstaendig im
+`net-rx`-Task.
+
+Der Task drainiert mit festem Treiberbudget. Ein erfolgreicher gemeinsamer
+Handoff gibt den Ringeintrag frei; bei voller 64-Slot-Netcore-Queue bleibt der
+aktuelle Ringkopf dagegen unveraendert und wird ereignisgesteuert erneut
+geplant. Der 10-ms-Poll ist nur Watchdog fuer fehlende oder unbrauchbare IRQ-
+Zustellung.

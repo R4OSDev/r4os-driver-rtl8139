@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     const run_guard_tests = b.addRunArtifact(guard_tests);
+    const irq_policy_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/irq_policy.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const run_irq_policy_tests = b.addRunArtifact(irq_policy_tests);
     const test_step = b.step("test", "Run RTL8139 RX recovery tests");
     test_step.dependOn(&run_guard_tests.step);
+    test_step.dependOn(&run_irq_policy_tests.step);
 }

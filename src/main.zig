@@ -1,5 +1,6 @@
 const r4os = @import("r4os");
 const rx_recovery = @import("rx_guard.zig");
+const irq_policy = @import("irq_policy.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("rtl8139_init", "rtl8139_shutdown"));
@@ -25,13 +26,13 @@ const CMD_RX_ENABLE: u8 = 0x08;
 const CMD_TX_ENABLE: u8 = 0x04;
 const CMD_RX_BUFFER_EMPTY: u8 = 0x01;
 
-const ISR_ROK: u16 = 1 << 0;
-const ISR_RER: u16 = 1 << 1;
-const ISR_TOK: u16 = 1 << 2;
-const ISR_TER: u16 = 1 << 3;
-const ISR_RXOVW: u16 = 1 << 4;
-const ISR_PUN: u16 = 1 << 5;
-const ISR_ACTIVE: u16 = ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_RXOVW | ISR_PUN;
+const ISR_ROK: u16 = irq_policy.rx_ok;
+const ISR_RER: u16 = irq_policy.rx_error;
+const ISR_TOK: u16 = irq_policy.tx_ok;
+const ISR_TER: u16 = irq_policy.tx_error;
+const ISR_RXOVW: u16 = irq_policy.rx_overflow;
+const ISR_PUN: u16 = irq_policy.packet_underrun;
+const ISR_ACTIVE: u16 = irq_policy.active_mask;
 
 const RCR_ACCEPT_PHYSICAL_MATCH: u32 = 1 << 1;
 const RCR_ACCEPT_BROADCAST: u32 = 1 << 3;
@@ -96,10 +97,8 @@ const State = struct {
     irq_active_route: u8 = 0xFF,
     irq_count: u64 = 0,
     irq_handled: u64 = 0,
-    // 0.56.21 (Befund 6.6 vorgezogen): IRQ-vs-Poll-Drain-Guard. Der
-    // aktivierte IRQ-Pfad kann den Poll-Task mitten in drainRx
-    // unterbrechen - ohne Guard bewegen beide den Ring-Cursor.
-    drain_busy: bool = false,
+    // 0.69.49: IRQs bewegen keinen Ring-Cursor mehr. Diese atomaren Bits
+    // uebergeben RX-Ursache und Recovery ausschliesslich an net-rx.
     drain_pending: bool = false,
     drain_pending_invalid: bool = false,
     drain_pending_ovw: bool = false,
@@ -113,6 +112,8 @@ const State = struct {
     watchdog_drains: u64 = 0,
     rx_recoveries: u64 = 0,
     rx_stall_recoveries: u64 = 0,
+    rx_handoff_busy: u64 = 0,
+    rx_budget_ends: u64 = 0,
     rx_head_guard: rx_recovery.Guard = .{},
     // 0.56.37: transmit() ist NICHT reentrant - Slot-Wahl, Puffer-Kopie
     // und TSAD/TSD-Writes muessen atomar zusammenbleiben. Seit der
@@ -146,6 +147,7 @@ export fn rtl8139_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state = .{ .api = api };
     poll_active = false;
     var ctx = context();
+    if (!ctx.apiCompatible()) return -10;
     ctx.logInfo("RTL8139.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -341,8 +343,15 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
     defer poll_active = false;
     var ctx = context();
     s.poll_count += 1;
+    const isr = ctx.portInw(s.io_base + REG_ISR);
+    serviceIsr(s, isr, false);
+
+    var pending = @atomicRmw(bool, &s.drain_pending, .Xchg, false, .acq_rel);
+    const count_invalid = @atomicRmw(bool, &s.drain_pending_invalid, .Xchg, false, .acq_rel);
+    const recover_overflow = @atomicRmw(bool, &s.drain_pending_ovw, .Xchg, false, .acq_rel);
+    if (count_invalid or recover_overflow) pending = true;
     var force_drain = false;
-    if (s.irq_registered and s.irq_count > 0) {
+    if (!pending and s.irq_registered and s.irq_count > 0) {
         // Watchdog statt Dauer-Abschaltung: Solange IRQs Fortschritt
         // machen, halten sich Polls zurueck; stagniert irq_count, wird
         // nach POLL_WATCHDOG_IDLE_POLLS defensiv gedraint.
@@ -356,24 +365,28 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
         s.watchdog_idle_polls = 0;
         s.watchdog_drains += 1;
         force_drain = true;
-    } else if (s.irq_registered) {
+    } else if (!pending and s.irq_registered) {
         s.poll_fallbacks += 1;
         if (s.poll_fallbacks < IRQ_FALLBACK_GRACE_POLLS) return;
         force_drain = true;
-    } else if (s.irq_mode == 2) {
+    } else if (!pending and s.irq_mode == 2) {
         s.poll_fallbacks += 1;
+        force_drain = true;
     }
-    const isr = ctx.portInw(s.io_base + REG_ISR);
-    // Drain nach Ring-Zustand (CMD_RX_BUFFER_EMPTY), nicht nur nach
-    // ISR-Bits: gelatchte/geackte ISR-Zustaende duerfen keine Frames
-    // im Ring liegen lassen.
-    if (s.irq_mode == 2 or force_drain) {
-        s.drain_busy = true;
-        drainRx(s, (isr & (ISR_RER | ISR_RXOVW | ISR_PUN)) != 0);
-        s.drain_busy = false;
-        flushDeferredDrain(s);
+
+    if (!pending and !force_drain) return;
+    const more_work = drainRx(s, count_invalid);
+    if (recover_overflow) {
+        if (more_work) {
+            @atomicStore(bool, &s.drain_pending_ovw, true, .release);
+        } else {
+            s.rx_overflow += 1;
+            recoverRxOverflow(s);
+        }
     }
-    serviceIsr(s, isr, false);
+    if (more_work or @atomicLoad(bool, &s.drain_pending, .acquire)) {
+        _ = ctx.netScheduleRx(s.adapter_index);
+    }
 }
 
 fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
@@ -576,49 +589,16 @@ fn serviceIsr(s: *State, raw_isr: u16, from_irq: bool) void {
     if ((isr & ISR_RER) != 0) s.rx_errors += 1;
     if ((isr & ISR_TER) != 0) s.tx_errors += 1;
     if ((isr & ISR_PUN) != 0) s.rx_errors += 1;
-    if (from_irq and s.drain_busy) {
-        // Poll-Kontext steht mitten im Ring-Drain: nur quittieren und
-        // Nacharbeit anmelden statt den Cursor parallel zu bewegen.
-        s.irq_deferred += 1;
-        s.drain_pending = true;
-        if ((isr & (ISR_RER | ISR_RXOVW | ISR_PUN)) != 0) s.drain_pending_invalid = true;
-        if ((isr & ISR_RXOVW) != 0) s.drain_pending_ovw = true;
-        ctx.portOutw(s.io_base + REG_ISR, isr);
-        return;
-    }
-    s.drain_busy = true;
-    drainRx(s, (isr & (ISR_RER | ISR_RXOVW | ISR_PUN)) != 0);
-    s.drain_busy = false;
     ctx.portOutw(s.io_base + REG_ISR, isr);
-    if ((isr & ISR_RXOVW) != 0) {
-        // 0.56.2: RX-Overflow stoppt den Receiver des RTL8139 dauerhaft -
-        // nur zaehlen reicht nicht (Root-Cause des Gate-Determinismus-
-        // Problems: nic_rx fror nach dem Boot-Burst ein). Erst retten,
-        // was im Ring liegt (drainRx oben), dann Receiver neu aufsetzen;
-        // verlorene Frames holt TCP per Retransmit zurueck.
-        s.rx_overflow += 1;
-        recoverRxOverflow(s);
-    }
-    flushDeferredDrain(s);
-}
+    if (!irq_policy.hasRxWork(isr)) return;
 
-// Vom IRQ angemeldete Nacharbeit im Task-Kontext abarbeiten; die
-// while-Schleife faengt IRQs, die WAEHREND des Nachlaufs deferren.
-fn flushDeferredDrain(s: *State) void {
-    while (s.drain_pending) {
-        s.drain_pending = false;
-        const invalid = s.drain_pending_invalid;
-        s.drain_pending_invalid = false;
-        const ovw = s.drain_pending_ovw;
-        s.drain_pending_ovw = false;
-        s.drain_busy = true;
-        drainRx(s, invalid);
-        s.drain_busy = false;
-        if (ovw) {
-            s.rx_overflow += 1;
-            recoverRxOverflow(s);
-        }
-    }
+    if (irq_policy.hasInvalidRx(isr)) @atomicStore(bool, &s.drain_pending_invalid, true, .release);
+    if (irq_policy.hasRxOverflow(isr)) @atomicStore(bool, &s.drain_pending_ovw, true, .release);
+    if (@atomicRmw(bool, &s.drain_pending, .Xchg, true, .acq_rel) and from_irq) s.irq_deferred += 1;
+
+    // The W1C acknowledgement above deasserts the shared line before the
+    // scheduler publication. TX-only causes stop here and never enter RX.
+    if (from_irq) _ = ctx.netScheduleRx(s.adapter_index);
 }
 
 fn recoverRxOverflow(s: *State) void {
@@ -642,13 +622,13 @@ fn recoverRxReceiver(s: *State, stalled_head: bool) void {
     }
 }
 
-fn drainRx(s: *State, count_invalid: bool) void {
+fn drainRx(s: *State, count_invalid: bool) bool {
     var ctx = context();
     var guard: usize = 0;
     const rx = rxBytes(s);
     if ((ctx.portInb(s.io_base + REG_COMMAND) & CMD_RX_BUFFER_EMPTY) != 0) {
         s.rx_head_guard.reset();
-        return;
+        return false;
     }
     while ((ctx.portInb(s.io_base + REG_COMMAND) & CMD_RX_BUFFER_EMPTY) == 0 and guard < RX_DRAIN_BUDGET) : (guard += 1) {
         const head = @as(usize, s.rx_head) % RX_BUFFER_SIZE;
@@ -666,25 +646,28 @@ fn drainRx(s: *State, count_invalid: bool) void {
         s.rx_head_guard.reset();
         const frame_len: usize = @intCast(len - 4);
         const frame_start = (head + 4) % RX_BUFFER_SIZE;
+        var handoff_result = r4os.abi.net_rx_handoff_invalid_frame;
         if (frame_start + frame_len <= RX_BUFFER_SIZE) {
             const frame = rx[frame_start .. frame_start + frame_len];
-            if (ctx.netReceiveFrame(s.adapter_index, frame) == 0) {
-                s.rx_ok += 1;
-            } else {
-                s.bad_frames += 1;
-            }
+            handoff_result = ctx.netReceiveFrame(s.adapter_index, frame);
         } else if (frame_len <= s.rx_scratch.len) {
             copyRxSpan(rx, frame_start, s.rx_scratch[0..frame_len]);
-            if (ctx.netReceiveFrame(s.adapter_index, s.rx_scratch[0..frame_len]) == 0) {
-                s.rx_ok += 1;
-            } else {
-                s.bad_frames += 1;
-            }
+            handoff_result = ctx.netReceiveFrame(s.adapter_index, s.rx_scratch[0..frame_len]);
+        }
+        if (handoff_result == r4os.abi.net_rx_handoff_busy) {
+            s.rx_handoff_busy += 1;
+            return true;
+        }
+        if (handoff_result == r4os.abi.net_rx_handoff_ok) {
+            s.rx_ok += 1;
         } else {
             s.bad_frames += 1;
         }
         advanceRx(s, 4 + @as(usize, len));
     }
+    const more_work = (ctx.portInb(s.io_base + REG_COMMAND) & CMD_RX_BUFFER_EMPTY) == 0 and guard >= RX_DRAIN_BUDGET;
+    if (more_work) s.rx_budget_ends += 1;
+    return more_work;
 }
 
 fn advanceRx(s: *State, bytes: usize) void {

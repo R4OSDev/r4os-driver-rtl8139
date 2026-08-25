@@ -4,13 +4,19 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.3`
 - Image target: `/R4OS/DRIVERS/RTL8139.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+The interrupt handler acknowledges and classifies device causes only. RX and
+recovery causes publish adapter work through DriverApi v23; the `net-rx` task
+then drains the ring into Netcore's bounded copying queue. TX-only causes do
+not enter the RX path. Queue backpressure retains the current ring head and
+requests another task activation.
 
 ## Build
 
