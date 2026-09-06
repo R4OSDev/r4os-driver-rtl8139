@@ -14,7 +14,7 @@ Build unter Linux:
 
     ./Build.sh test
 
-Artefakt: zig-out/RTL8139.R4D
+Artefakt: Artifacts/Modules/RTL8139/RTL8139.R4D (Workspace; ARTIFACTS_ROOT aus Settings.R4S)
 
 Manifest:
 
