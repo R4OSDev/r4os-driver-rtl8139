@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.3`
+- Version: `0.1.4`
 - Image target: `/R4OS/DRIVERS/RTL8139.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -44,3 +44,8 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+TX timeout is diagnostic only. The pending slot and payload remain unchanged
+until TOK/TUN or confirmed chip reset; transmit reports busy meanwhile. Each
+timed-out pending transfer increments the error count once, never per poll.

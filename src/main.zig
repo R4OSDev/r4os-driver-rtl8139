@@ -135,7 +135,8 @@ const State = struct {
     tx_pending_since: [TX_SLOT_COUNT]u64 = .{0} ** TX_SLOT_COUNT,
     tx_stuck_ticks: u64 = 300,
     tx_busy: u64 = 0,
-    tx_stuck_reclaims: u64 = 0,
+    tx_stuck_reports: u64 = 0,
+    tx_timeout_reported: [TX_SLOT_COUNT]bool = .{false} ** TX_SLOT_COUNT,
     rx_scratch: [1536]u8 = .{0} ** 1536,
 };
 
@@ -274,21 +275,12 @@ fn txSlotFree(s: *State, ctx: *const r4os.r4dev.DriverContext, slot: usize) bool
         s.tx_pending[slot] = false;
         return true;
     }
-    // Sicherheitsnetz gegen echt verlorene TOKs (nur nach Chip-Anomalien):
-    // ein Deskriptor, der nach ~300 Polls (~3 s; legitime QEMU-Flugzeit
-    // liegt bei Millisekunden) weder TOK noch TUN hat, ist tot. 0.56.11:
-    // Schwelle von 2000 (~20 s) gesenkt - sie lag LAENGER als das
-    // 15-s-Write-Budget des SSHD, ein Lost-TOK-Stall liess damit ganze
-    // Sessions kollabieren (write_retry=251, worker max_ticks=1627),
-    // bevor der Slot sich selbst heilte. Nicht tiefer setzen, sonst
-    // droht wieder die Wiederverwendung live gelesener Puffer.
-    // 0.56.40 (ex 0.56.29b): Schwelle auf ECHTZEIT umgestellt -
-    // 3 s via tickCount/timerFrequency statt 300 Polls.
-    if (ctx.tickCount() -% s.tx_pending_since[slot] > s.tx_stuck_ticks) {
+    // Time is diagnostic only: it cannot prove that the chip stopped reading.
+    // Keep the payload and return backpressure until TOK/TUN or a proven reset.
+    if (!s.tx_timeout_reported[slot] and ctx.tickCount() -% s.tx_pending_since[slot] > s.tx_stuck_ticks) {
+        s.tx_timeout_reported[slot] = true;
         s.tx_errors += 1;
-        s.tx_stuck_reclaims += 1;
-        s.tx_pending[slot] = false;
-        return true;
+        s.tx_stuck_reports += 1;
     }
     return false;
 }
@@ -329,6 +321,7 @@ fn transmit(raw_context: ?*anyopaque, frame: [*]const u8, len: u32) callconv(.c)
     while (i < len) : (i += 1) tx[i] = frame[i];
     ctx.portOutl(s.io_base + REG_TSAD0 + @as(u16, @intCast(slot * 4)), @truncate(s.dma.phys_addr + RX_DMA_SIZE + slot * TX_BUFFER_SIZE));
     ctx.portOutl(s.io_base + REG_TSD0 + @as(u16, @intCast(slot * 4)), TSD_ERTXTH | len);
+    s.tx_timeout_reported[slot] = false;
     s.tx_pending[slot] = true;
     s.tx_pending_since[slot] = ctx.tickCount();
     s.tx_slot = @intCast((slot + 1) % TX_SLOT_COUNT);
@@ -453,6 +446,7 @@ fn clearTxPending(s: *State) void {
     while (slot < TX_SLOT_COUNT) : (slot += 1) {
         s.tx_pending[slot] = false;
         s.tx_pending_since[slot] = 0;
+        s.tx_timeout_reported[slot] = false;
     }
 }
 
