@@ -206,7 +206,7 @@ export fn rtl8139_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     const adapter = ctx.registerNetBackend("rtl8139", &backend);
     if (adapter < 0) {
         ctx.logError("RTL8139.R4D register_net_backend failed");
-        shutdownHardware(&ctx);
+        _ = shutdownHardware(&ctx);
         return -6;
     }
 
@@ -224,8 +224,7 @@ export fn rtl8139_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 export fn rtl8139_shutdown() callconv(.c) i32 {
     var ctx = context();
     ctx.logInfo("RTL8139.R4D shutdown");
-    shutdownHardware(&ctx);
-    return 0;
+    return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
 fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
@@ -385,8 +384,7 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
 fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
     _ = raw_context;
     var ctx = context();
-    shutdownHardware(&ctx);
-    return 0;
+    return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
 fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c) i32 {
@@ -419,23 +417,31 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
     return 0;
 }
 
-fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
+fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.io_base != 0) {
         ctx.portOutw(state.io_base + REG_IMR, 0);
         ctx.portOutw(state.io_base + REG_ISR, 0xFFFF);
         ctx.portOutb(state.io_base + REG_COMMAND, 0);
     }
     if (state.irq_registered) {
+        var remaining: usize = 0;
         var index: usize = 0;
         while (index < state.irq_route_count) : (index += 1) {
-            _ = ctx.irqUnregister(state.irq_routes[index], irqHandler, @intFromPtr(&state));
+            const route = state.irq_routes[index];
+            if (ctx.irqUnregister(route, irqHandler, @intFromPtr(&state)) != 0) {
+                state.irq_routes[remaining] = route;
+                remaining += 1;
+            }
         }
-        state.irq_registered = false;
-        state.irq_route_count = 0;
+        @memset(state.irq_routes[remaining..], 0xFF);
+        state.irq_registered = remaining != 0;
+        state.irq_route_count = remaining;
+        if (remaining != 0) return false;
     }
     if (state.dma.phys_addr != 0) ctx.freeDmaRegion(&state.dma);
     state.active = false;
     state.registered = false;
+    return true;
 }
 
 // 0.56.7 (TX v2): Nach einem echten Chip-Setup sind in-flight Sends
