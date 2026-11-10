@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.6`
 - Image target: `/R4OS/DRIVERS/RTL8139.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -13,7 +13,7 @@ The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
 The interrupt handler acknowledges and classifies device causes only. RX and
-recovery causes publish adapter work through DriverApi v23; the `net-rx` task
+recovery causes publish adapter work through DriverApi2; the `net-rx` task
 then drains the ring into Netcore's bounded copying queue. TX-only causes do
 not enter the RX path. Queue backpressure retains the current ring head and
 requests another task activation.
@@ -49,3 +49,5 @@ and `NOTICE`. Any repository-specific external material is documented in
 TX timeout is diagnostic only. The pending slot and payload remain unchanged
 until TOK/TUN or confirmed chip reset; transmit reports busy meanwhile. Each
 timed-out pending transfer increments the error count once, never per poll.
+
+Version0.1.6 uses real DriverInit2/DriverApi2 and R4DEV:Query2:2 with exact required slot admission. Reset polling uses the existing pure SDK no-sleep budget; ring progress, TX timeout diagnostics, IRQ publication and retained payload/ownership are unchanged.

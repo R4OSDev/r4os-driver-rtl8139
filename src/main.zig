@@ -3,7 +3,7 @@ const rx_recovery = @import("rx_guard.zig");
 const irq_policy = @import("irq_policy.zig");
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("rtl8139_init", "rtl8139_shutdown"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.driverEntriesAsm("rtl8139_init", "rtl8139_shutdown"));
 }
 
 const VENDOR_REALTEK: u16 = 0x10EC;
@@ -72,7 +72,7 @@ const IRQ_FALLBACK_GRACE_POLLS: u64 = 32;
 const POLL_WATCHDOG_IDLE_POLLS: u64 = 16;
 
 const State = struct {
-    api: *const r4os.r4dev.DriverApi = undefined,
+    api: *const r4os.r4dev.DriverApi2 = undefined,
     active: bool = false,
     registered: bool = false,
     info: r4os.abi.PciDeviceInfo = .{},
@@ -144,11 +144,11 @@ var state: State = .{};
 var backend: r4os.abi.NetBackend = .{};
 var poll_active: bool = false;
 
-export fn rtl8139_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
+export fn rtl8139_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
     state = .{ .api = api };
     poll_active = false;
     var ctx = context();
-    if (!ctx.apiCompatible()) return -10;
+    if (!ctx.requires(.{ "get_option", "alloc_dma_region", "free_dma_region", "irq_register", "irq_unregister", "net_receive_frame", "net_schedule_rx", "pci_device_at", "pci_device_count", "pci_enable_bus_master", "pci_find_by_class", "pci_read_bar", "port_inb", "port_inw", "port_inl", "port_outb", "port_outw", "port_outl", "register_net_backend", "tick_count", "timer_frequency" })) return -10;
     ctx.logInfo("RTL8139.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -227,7 +227,7 @@ export fn rtl8139_shutdown() callconv(.c) i32 {
     return if (shutdownHardware(&ctx)) 0 else -1;
 }
 
-fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
+fn findDevice(ctx: *const r4os.r4dev.DriverContext2) ?r4os.abi.PciDeviceInfo {
     var index: u32 = 0;
     const total = ctx.pciDeviceCount();
     while (index < total) : (index += 1) {
@@ -261,7 +261,7 @@ fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
 // - TCP paced per Retransmit. Kein Force-Reclaim: verlorene TOKs gibt es
 // nur nach Chip-Reset, und dort (prepareTraffic/recoverRxOverflow) wird
 // die pending-Buchhaltung explizit geleert.
-fn txSlotFree(s: *State, ctx: *const r4os.r4dev.DriverContext, slot: usize) bool {
+fn txSlotFree(s: *State, ctx: *const r4os.r4dev.DriverContext2, slot: usize) bool {
     if (!s.tx_pending[slot]) return true;
     const status_word = ctx.portInl(s.io_base + REG_TSD0 + @as(u16, @intCast(slot * 4)));
     if ((status_word & TSD_TOK) != 0) {
@@ -417,7 +417,7 @@ fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c
     return 0;
 }
 
-fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (state.io_base != 0) {
         ctx.portOutw(state.io_base + REG_IMR, 0);
         ctx.portOutw(state.io_base + REG_ISR, 0xFFFF);
@@ -456,7 +456,7 @@ fn clearTxPending(s: *State) void {
     }
 }
 
-fn prepareTraffic(ctx: *const r4os.r4dev.DriverContext) void {
+fn prepareTraffic(ctx: *const r4os.r4dev.DriverContext2) void {
     ctx.portOutw(state.io_base + REG_IMR, 0);
     ctx.portOutw(state.io_base + REG_ISR, 0xFFFF);
     ctx.portOutl(state.io_base + REG_RBSTART, @truncate(state.dma.phys_addr));
@@ -474,7 +474,7 @@ fn prepareTraffic(ctx: *const r4os.r4dev.DriverContext) void {
     ctx.portOutb(state.io_base + REG_COMMAND, CMD_RX_ENABLE | CMD_TX_ENABLE);
 }
 
-fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext) void {
+fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext2) void {
     state.irq_mode = 0;
     state.irq_registered = false;
     state.irq_register_result = 0;
@@ -524,7 +524,7 @@ fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
-fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext2, route: u8) bool {
     if (route >= 32 or state.irq_route_count >= state.irq_routes.len) return false;
     var index: usize = 0;
     while (index < state.irq_route_count) : (index += 1) {
@@ -538,7 +538,7 @@ fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
     return true;
 }
 
-fn irqDisabled(ctx: *const r4os.r4dev.DriverContext) bool {
+fn irqDisabled(ctx: *const r4os.r4dev.DriverContext2) bool {
     const value = ctx.getOption("RTL8139", "irq");
     return zEqIgnoreCase(value, "off") or zEqIgnoreCase(value, "disabled") or zEqIgnoreCase(value, "0");
 }
@@ -679,20 +679,20 @@ fn advanceRx(s: *State, bytes: usize) void {
     ctx.portOutw(s.io_base + REG_CAPR, capr);
 }
 
-fn wakeDevice(ctx: *const r4os.r4dev.DriverContext) void {
+fn wakeDevice(ctx: *const r4os.r4dev.DriverContext2) void {
     ctx.portOutb(state.io_base + REG_CONFIG1, 0);
 }
 
-fn softReset(ctx: *const r4os.r4dev.DriverContext) bool {
+fn softReset(ctx: *const r4os.r4dev.DriverContext2) bool {
     ctx.portOutb(state.io_base + REG_COMMAND, CMD_RESET);
-    var spin: usize = 0;
-    while (spin < 100000) : (spin += 1) {
+    var budget = r4os.driver_poll_budget.DriverPollBudget.initIterations(100000, .no_sleep);
+    while (budget.step(null, false) == .proceed) {
         if ((ctx.portInb(state.io_base + REG_COMMAND) & CMD_RESET) == 0) return true;
     }
     return false;
 }
 
-fn readMac(ctx: *const r4os.r4dev.DriverContext) void {
+fn readMac(ctx: *const r4os.r4dev.DriverContext2) void {
     var i: u16 = 0;
     while (i < 6) : (i += 1) state.mac[i] = ctx.portInb(state.io_base + REG_IDR0 + i);
 }
@@ -702,8 +702,8 @@ fn stateFrom(raw_context: ?*anyopaque) ?*State {
     return @ptrCast(@alignCast(ptr));
 }
 
-fn context() r4os.r4dev.DriverContext {
-    return r4os.r4dev.DriverContext.init(state.api);
+fn context() r4os.r4dev.DriverContext2 {
+    return r4os.r4dev.DriverContext2.init(state.api);
 }
 
 fn rxBytes(s: *State) []u8 {
