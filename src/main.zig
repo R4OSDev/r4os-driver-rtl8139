@@ -515,7 +515,7 @@ fn setupInterrupt(ctx: *const r4os.r4dev.DriverContext2) void {
     if (state.irq_route_count > 0) {
         state.irq_registered = true;
         state.irq_mode = 1;
-        ctx.portOutw(state.io_base + REG_IMR, ISR_ACTIVE);
+        ctx.portOutw(state.io_base + REG_IMR, irq_policy.interrupt_mask);
         ctx.logInfo("RTL8139.R4D irq registered");
     } else {
         state.irq_mode = 2;

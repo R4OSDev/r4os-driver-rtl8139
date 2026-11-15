@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.6`
+- Version: `0.1.7`
 - Image target: `/R4OS/DRIVERS/RTL8139.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -17,6 +17,11 @@ recovery causes publish adapter work through DriverApi2; the `net-rx` task
 then drains the ring into Netcore's bounded copying queue. TX-only causes do
 not enter the RX path. Queue backpressure retains the current ring head and
 requests another task activation.
+
+The enabled interrupt mask excludes `TX_OK` while retaining all previous
+error and RX sources. The full status mask remains available for
+acknowledgement; TSD completion, retained TX buffers and stall diagnostics
+keep their existing sender-owned lifecycle.
 
 ## Build
 

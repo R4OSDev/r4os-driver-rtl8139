@@ -6,6 +6,9 @@ pub const rx_overflow: u16 = 1 << 4;
 pub const packet_underrun: u16 = 1 << 5;
 
 pub const active_mask: u16 = rx_ok | rx_error | tx_ok | tx_error | rx_overflow | packet_underrun;
+// TSD reclaim is lazy; keep TX_OK in the acknowledged status, but do not
+// raise an interrupt for a successful send. All error causes stay enabled.
+pub const interrupt_mask: u16 = active_mask & ~tx_ok;
 pub const rx_mask: u16 = rx_ok | rx_error | rx_overflow | packet_underrun;
 pub const invalid_mask: u16 = rx_error | rx_overflow | packet_underrun;
 
@@ -23,6 +26,7 @@ pub fn hasRxOverflow(raw_isr: u16) bool {
 
 test "TX-only causes never schedule RX" {
     const std = @import("std");
+    try std.testing.expectEqual(@as(u16, 0x003B), interrupt_mask);
     try std.testing.expect(!hasRxWork(tx_ok));
     try std.testing.expect(!hasRxWork(tx_error));
     try std.testing.expect(!hasRxWork(tx_ok | tx_error));
