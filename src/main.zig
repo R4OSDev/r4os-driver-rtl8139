@@ -99,6 +99,8 @@ const State = struct {
     irq_handled: u64 = 0,
     // 0.69.49: IRQs bewegen keinen Ring-Cursor mehr. Diese atomaren Bits
     // uebergeben RX-Ursache und Recovery ausschliesslich an net-rx.
+    media_dirty: bool = false,
+    carrier_up: bool = false,
     drain_pending: bool = false,
     drain_pending_invalid: bool = false,
     drain_pending_ovw: bool = false,
@@ -211,6 +213,7 @@ export fn rtl8139_init(api: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
     }
 
     state.adapter_index = adapter;
+    publishMedia(&state);
     state.registered = true;
     // 0.56.40: Dead-Slot-Schwelle in echten Ticks (3 s).
     state.tx_stuck_ticks = 3 * @as(u64, ctx.timerFrequency());
@@ -337,6 +340,7 @@ fn poll(raw_context: ?*anyopaque) callconv(.c) void {
     s.poll_count += 1;
     const isr = ctx.portInw(s.io_base + REG_ISR);
     serviceIsr(s, isr, false);
+    if (@atomicLoad(bool, &s.media_dirty, .acquire) and @atomicRmw(bool, &s.media_dirty, .Xchg, false, .acq_rel)) publishMedia(s);
 
     var pending = @atomicRmw(bool, &s.drain_pending, .Xchg, false, .acq_rel);
     const count_invalid = @atomicRmw(bool, &s.drain_pending_invalid, .Xchg, false, .acq_rel);
@@ -390,7 +394,7 @@ fn backendShutdown(raw_context: ?*anyopaque) callconv(.c) i32 {
 fn status(raw_context: ?*anyopaque, out: *r4os.abi.NetBackendStatus) callconv(.c) i32 {
     const s = stateFrom(raw_context) orelse return -1;
     out.* = .{
-        .link_up = if (s.active) 1 else 0,
+        .link_up = @intFromBool(s.active and @atomicLoad(bool, &s.carrier_up, .acquire)),
         .rx_packets = s.rx_ok,
         .tx_packets = s.tx_ok,
         .drops = s.bad_frames,
@@ -574,6 +578,30 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     return r4os.abi.irq_result_handled;
 }
 
+// MediaStatus supplies carrier and line speed. Duplex requires successful
+// PHY negotiation (or the forced BMCR mode) and stays unknown otherwise.
+fn publishMedia(s: *State) void {
+    const ctx = context();
+    const media = ctx.portInb(s.io_base + 0x58);
+    const up = (media & 0x04) == 0;
+    @atomicStore(bool, &s.carrier_up, up, .release);
+    if (ctx.function("net_publish_media") == null) return;
+    const rate: u64 = if (!up) 0 else if ((media & 8) != 0) 10_000_000 else 100_000_000;
+    var duplex: u8 = 0;
+    if (up) {
+        const control = ctx.portInw(s.io_base + 0x62);
+        if ((control & 0x1000) == 0) {
+            duplex = if ((control & 0x100) != 0) 2 else 1;
+        } else if ((ctx.portInw(s.io_base + 0x64) & 0x20) != 0) {
+            const common = ctx.portInw(s.io_base + 0x66) & ctx.portInw(s.io_base + 0x68);
+            const full: u16 = if (rate == 100_000_000) 0x100 else 0x40;
+            const half: u16 = if (rate == 100_000_000) 0x80 else 0x20;
+            duplex = if ((common & full) != 0) 2 else if ((common & half) != 0) 1 else 0;
+        }
+    }
+    ctx.netPublishMedia(s.adapter_index, if (up) 2 else 1, duplex, rate, rate);
+}
+
 fn irqDisplayLine(s: *State) u8 {
     if (s.irq_active_route != 0xFF) return s.irq_active_route;
     if (s.irq_route_count > 0) return s.irq_routes[0];
@@ -588,7 +616,10 @@ fn serviceIsr(s: *State, raw_isr: u16, from_irq: bool) void {
     if ((isr & ISR_TOK) != 0 and from_irq) s.irq_tx_ok += 1;
     if ((isr & ISR_RER) != 0) s.rx_errors += 1;
     if ((isr & ISR_TER) != 0) s.tx_errors += 1;
-    if ((isr & ISR_PUN) != 0) s.rx_errors += 1;
+    if ((isr & ISR_PUN) != 0) {
+        @atomicStore(bool, &s.media_dirty, true, .release);
+        s.rx_errors += 1;
+    }
     ctx.portOutw(s.io_base + REG_ISR, isr);
     if (!irq_policy.hasRxWork(isr)) return;
 
